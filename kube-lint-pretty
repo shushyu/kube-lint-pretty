@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+# kube-lint-pretty — lesbarer Wrapper um `kube-linter lint`
+#
+# Aufruf:   kube-lint-pretty [kube-linter-Optionen] <datei|verzeichnis>...
+# Umgebung: NO_COLOR=1     keine ANSI-Farben
+#           FORCE_COLOR=1  Farben auch ohne TTY (z. B. CI-Logs)
+#           NO_UNICODE=1   ASCII-Fallback
+#           KLP_FIX=1      Remediation je Finding anzeigen
+#           KLP_RAW=1      Originalausgabe von kube-linter statt Pretty-Output
+#           KUBE_LINTER    Pfad/Name des Binaries (Default: kube-linter)
+#
+# Bewusst kein `set -e`: kube-linter liefert bei Findings Exit-Code 1.
+set -uo pipefail
+
+KUBE_LINTER=${KUBE_LINTER:-kube-linter}
+SEP=$'\037'
+
+usage() {
+  cat <<'EOF'
+Usage: kube-lint-pretty [kube-linter-Optionen] <datei|verzeichnis>...
+
+  kube-lint-pretty insecure.yaml
+  kube-lint-pretty --config .kube-linter.yaml ./manifests
+
+Env: NO_COLOR, FORCE_COLOR, NO_UNICODE, KLP_FIX=1 (Remediation), KLP_RAW=1 (Originalausgabe)
+Exit-Code = Exit-Code von kube-linter.
+EOF
+}
+
+case "${1:-}" in
+  "")        usage >&2; exit 2 ;;
+  -h|--help) usage; exit 0 ;;
+esac
+
+if ! command -v "$KUBE_LINTER" >/dev/null 2>&1; then
+  echo "kube-lint-pretty: '$KUBE_LINTER' nicht im PATH gefunden." >&2
+  exit 127
+fi
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/kube-lint-pretty.XXXXXX") || exit 70
+trap 'rm -rf "$tmp"' EXIT
+raw=$tmp/raw parsed=$tmp/parsed sorted=$tmp/sorted
+
+# --- KubeLinter ausführen (stdout+stderr zusammen, Exit-Code erhalten) --------
+"$KUBE_LINTER" lint "$@" >"$raw" 2>&1
+lint_rc=$?
+
+if [ "${KLP_RAW:-}" = 1 ]; then
+  cat "$raw"
+  exit "$lint_rc"
+fi
+
+# --- Parsing: nur Zeilen mit "(object: …) … (check: …, remediation: …)" ------
+# Ausgabe pro Finding (Trenner \037):
+#   key src ns name api kind check message remediation
+# Mehrzeilige Remediations werden angehängt, solange die Zeile nicht mit ")" endet.
+LC_ALL=C awk '
+function flush(   line,p,rest,q,obj,body,tag,pos,start,i,msg,tail,c,chk,rem,sp,nn,gk,k,api,kind,sl,ns,name,src) {
+  if (buf == "") return
+  line = buf; buf = ""
+  p = index(line, ": (object: ")
+  if (p == 0) return
+  src  = substr(line, 1, p - 1)
+  rest = substr(line, p + 11)
+  q = index(rest, ") ")
+  if (q == 0) return
+  obj  = substr(rest, 1, q - 1)
+  body = substr(rest, q + 2)
+
+  # letztes " (check: " suchen (Meldungstext könnte selbst Klammern enthalten)
+  tag = " (check: "; pos = 0; start = 1
+  while ((i = index(substr(body, start), tag)) > 0) { pos = start + i - 1; start = pos + 1 }
+  if (pos == 0) return
+  msg  = substr(body, 1, pos - 1)
+  tail = substr(body, pos + length(tag))
+  if (substr(tail, length(tail), 1) == ")") tail = substr(tail, 1, length(tail) - 1)
+  c = index(tail, ", remediation: ")
+  if (c > 0) { chk = substr(tail, 1, c - 1); rem = substr(tail, c + 15) }
+  else       { chk = tail; rem = "" }
+  if (chk !~ /^[a-z0-9][a-z0-9_-]*$/) return
+
+  # Objekt: "ns/name apiVersion, Kind=Kind"
+  sp = index(obj, " ")
+  if (sp > 0) { nn = substr(obj, 1, sp - 1); gk = substr(obj, sp + 1) } else { nn = obj; gk = "" }
+  k = index(gk, ", Kind=")
+  if (k > 0) { api = substr(gk, 1, k - 1); kind = substr(gk, k + 7) } else { api = gk; kind = "" }
+  sl = index(nn, "/")
+  if (sl > 0) { ns = substr(nn, 1, sl - 1); name = substr(nn, sl + 1) } else { ns = ""; name = nn }
+
+  print src "|" nn "|" kind SEP src SEP ns SEP name SEP api SEP kind SEP chk SEP msg SEP rem
+}
+BEGIN { SEP = sprintf("%c", 31); buf = "" }
+{
+  if (index($0, ": (object: ") > 0) { flush(); buf = $0; next }
+  if ($0 ~ /^Error: /)              { flush(); next }
+  if (buf != "") {
+    if (buf ~ /\)$/) flush()
+    else if ($0 !~ /^[ \t]*$/) buf = buf " " $0
+  }
+}
+END { flush() }
+' "$raw" >"$parsed"
+
+total=$(( $(wc -l <"$parsed") ))
+
+# --- Keine Findings: Erfolg oder echter Tool-Fehler ----------------------------
+use_color=0
+if [ -z "${NO_COLOR:-}" ]; then
+  if [ -n "${FORCE_COLOR:-}" ]; then
+    use_color=1
+  elif [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
+    use_color=1
+  fi
+fi
+
+use_unicode=1
+if [ -n "${NO_UNICODE:-}" ]; then
+  use_unicode=0
+else
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) ;;
+    *) use_unicode=0 ;;
+  esac
+fi
+
+if [ "$use_color" -eq 1 ]; then
+  BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GRN=$'\e[32m' CYAN=$'\e[2;36m' RST=$'\e[0m'
+else
+  BOLD='' DIM='' RED='' GRN='' CYAN='' RST=''
+fi
+
+if [ "$use_unicode" -eq 1 ]; then
+  OK='✓' FAIL='✗' ELL='…'
+  GLYPH=('' '█' '▓' '▒' '░' '·')
+else
+  OK='[OK]' FAIL='[FAIL]' ELL='...'
+  GLYPH=('' '#' '=' '+' '-' '.')
+fi
+
+if [ "$total" -eq 0 ]; then
+  if [ "$lint_rc" -eq 0 ]; then
+    printf '%s%s%s KubeLinter: no findings.\n' "$GRN" "$OK" "$RST"
+  else
+    # Nichts Parsbares, aber Fehlercode: Originalausgabe durchreichen
+    cat "$raw" >&2
+  fi
+  exit "$lint_rc"
+fi
+
+
+# --- Layout ---------------------------------------------------------------------
+cols=""
+if [ -t 1 ]; then cols=$(tput cols 2>/dev/null) || cols=""; fi
+case $cols in ''|*[!0-9]*) cols=${COLUMNS:-100} ;; esac
+case $cols in ''|*[!0-9]*) cols=100 ;; esac
+W=$cols
+[ "$W" -lt 40 ] && W=40
+[ "$W" -gt 84 ] && W=84
+
+# Kategorien: 1 Security, 2 Reliability, 3 Resources, 4 Hygiene, 5 Other
+CNAME=('' Security Reliability Resources Hygiene Other)
+if [ "$use_color" -eq 1 ]; then
+  CCOL=('' $'\e[31m' $'\e[33m' $'\e[36m' $'\e[35m' $'\e[90m')
+else
+  CCOL=('' '' '' '' '' '')
+fi
+
+cat_for() {
+  case $1 in
+    access-to-create-pods|access-to-secrets|cluster-admin-role-binding|default-service-account|\
+    docker-sock|drop-net-raw-capability|env-var-secret|exposed-services|host-ipc|host-network|\
+    host-pid|no-read-only-root-fs|privilege-escalation-container|privileged-container|\
+    privileged-ports|read-secret-from-env-var|run-as-non-root|sensitive-host-mounts|ssh-port|\
+    unsafe-proc-mount|unsafe-sysctls|wildcard-in-rules|writable-host-mount) CR=1 ;;
+    minimum-three-replicas|hpa-minimum-three-replicas|no-anti-affinity|no-liveness-probe|\
+    no-readiness-probe|no-rolling-update-strategy|dangling-service|mismatching-selector|\
+    non-existent-service-account|pdb-*|liveness-port|readiness-port|startup-port) CR=2 ;;
+    unset-cpu-requirements|unset-memory-requirements) CR=3 ;;
+    latest-tag|use-namespace|deprecated-service-account-field|required-*|\
+    no-extensions-v1beta|restart-policy|target-port|job-ttl-seconds-after-finished) CR=4 ;;
+    *) CR=5 ;;
+  esac
+}
+
+# erstes Zeichen groß (portabel, kein ${var^})
+ucfirst() {
+  local f
+  f=$(printf '%s' "${1:0:1}" | tr '[:lower:]' '[:upper:]')
+  UC="$f${1:1}"
+}
+
+# wrap TEXT BREITE MAXZEILEN -> Array WRAPPED (Abschneiden nur am Ende, mit …)
+wrap() {
+  local text=$1 width=$2 max=$3 word line="" last
+  local -a words
+  WRAPPED=()
+  read -r -a words <<<"$text"
+  for word in ${words[@]+"${words[@]}"}; do
+    if [ "${#word}" -gt "$width" ]; then word=${word:0:$(( width - ${#ELL} ))}$ELL; fi
+    if [ -z "$line" ]; then
+      line=$word
+    elif [ $(( ${#line} + 1 + ${#word} )) -le "$width" ]; then
+      line+=" $word"
+    else
+      WRAPPED+=("$line"); line=$word
+    fi
+  done
+  [ -n "$line" ] && WRAPPED+=("$line")
+  if [ "${#WRAPPED[@]}" -gt "$max" ]; then
+    WRAPPED=("${WRAPPED[@]:0:$max}")
+    last=${WRAPPED[max - 1]}
+    if [ $(( ${#last} + ${#ELL} )) -gt "$width" ]; then last=${last:0:$(( width - ${#ELL} ))}; fi
+    WRAPPED[max - 1]="${last%[ .,;:]}$ELL"
+  fi
+}
+
+# Check-Name -> lesbarer Titel (TITLE)
+title_for() {
+  case $1 in
+    access-to-create-pods)            TITLE="Role may create pods" ;;
+    access-to-secrets)                TITLE="Role may access secrets" ;;
+    cluster-admin-role-binding)       TITLE="cluster-admin role binding" ;;
+    default-service-account)          TITLE="Default service account in use" ;;
+    dangling-service)                 TITLE="Service without matching pods" ;;
+    deprecated-service-account-field) TITLE="Deprecated serviceAccount field" ;;
+    docker-sock)                      TITLE="Docker socket mounted" ;;
+    drop-net-raw-capability)          TITLE="NET_RAW capability configuration" ;;
+    env-var-secret)                   TITLE="Secret-like value in env var" ;;
+    exposed-services)                 TITLE="Service exposed externally" ;;
+    host-ipc)                         TITLE="Host IPC namespace enabled" ;;
+    host-network)                     TITLE="Host network namespace enabled" ;;
+    host-pid)                         TITLE="Host process namespace enabled" ;;
+    latest-tag)                       TITLE="Image uses :latest" ;;
+    minimum-three-replicas)           TITLE="Fewer than three replicas" ;;
+    mismatching-selector)             TITLE="Selector does not match labels" ;;
+    no-anti-affinity)                 TITLE="No pod anti-affinity" ;;
+    no-liveness-probe)                TITLE="Liveness probe missing" ;;
+    no-read-only-root-fs)             TITLE="Writable root filesystem" ;;
+    no-readiness-probe)               TITLE="Readiness probe missing" ;;
+    no-rolling-update-strategy)       TITLE="No rolling update strategy" ;;
+    non-existent-service-account)     TITLE="Service account does not exist" ;;
+    privilege-escalation-container)   TITLE="Privilege escalation allowed" ;;
+    privileged-container)             TITLE="Privileged container" ;;
+    privileged-ports)                 TITLE="Privileged port in use" ;;
+    read-secret-from-env-var)         TITLE="Secret read from env var" ;;
+    run-as-non-root)                  TITLE="Container may run as root" ;;
+    sensitive-host-mounts)            TITLE="Sensitive host path mounted" ;;
+    ssh-port)                         TITLE="SSH port exposed" ;;
+    unsafe-proc-mount)                TITLE="Unsafe /proc mount" ;;
+    unsafe-sysctls)                   TITLE="Unsafe sysctls" ;;
+    unset-cpu-requirements)           TITLE="CPU requirements missing" ;;
+    unset-memory-requirements)        TITLE="Memory requirements missing" ;;
+    use-namespace)                    TITLE="Default namespace in use" ;;
+    wildcard-in-rules)                TITLE="Wildcard in RBAC rules" ;;
+    writable-host-mount)              TITLE="Writable host mount" ;;
+    *)
+      local IFS=- w out=""
+      for w in $1; do ucfirst "$w"; out+="${out:+ }$UC"; done
+      TITLE=$out ;;
+  esac
+}
+
+# Meldung aufbereiten (PMSG); bei Unbekanntem Fallback: Präfixe entfernen
+pretty_msg() {
+  local chk=$1 msg=$2 cq="Container" re
+  re='[Cc]ontainer "([^"]*)"'
+  [[ $msg =~ $re ]] && cq="Container \"${BASH_REMATCH[1]}\""
+  PMSG=""
+  case $chk in
+    drop-net-raw-capability)
+      case $msg in
+        *"has ADD capability"*) PMSG="$cq adds the forbidden NET_RAW capability." ;;
+        *"does not drop"*)      PMSG="$cq does not drop NET_RAW." ;;
+      esac ;;
+    host-network)  PMSG="Workload shares the host network namespace." ;;
+    host-pid)      PMSG="Workload shares the host process namespace." ;;
+    host-ipc)      PMSG="Workload shares the host IPC namespace." ;;
+    latest-tag)
+      re='image, "([^"]*)"'
+      if [[ $msg =~ $re ]]; then
+        PMSG="$cq uses ${BASH_REMATCH[1]}; use an immutable, versioned image tag."
+      fi ;;
+    no-read-only-root-fs)           PMSG="$cq does not use a read-only root filesystem." ;;
+    privilege-escalation-container) PMSG="$cq permits privilege escalation." ;;
+    privileged-container)           PMSG="$cq runs in privileged mode." ;;
+    run-as-non-root)                PMSG="$cq is not configured with runAsNonRoot." ;;
+    unset-cpu-requirements)
+      re='cpu (request|limit)'
+      [[ $msg =~ $re ]] && PMSG="$cq has no CPU ${BASH_REMATCH[1]}." ;;
+    unset-memory-requirements)
+      re='memory (request|limit)'
+      [[ $msg =~ $re ]] && PMSG="$cq has no memory ${BASH_REMATCH[1]}." ;;
+  esac
+  if [ -z "$PMSG" ]; then
+    local m=${msg#object }
+    m=${m#resource }
+    ucfirst "$m"; PMSG=$UC
+  fi
+}
+
+
+# --- Sortieren: Objekt > Kategorie > Check (stabil) ------------------------------
+c_cat=(0 0 0 0 0 0)
+while IFS=$SEP read -r key src ns name api kind chk msg rem; do
+  cat_for "$chk"
+  c_cat[CR]=$(( c_cat[CR] + 1 ))
+  printf '%s\n' "${key}${SEP}${CR}${SEP}${chk}${SEP}${src}${SEP}${ns}${SEP}${name}${SEP}${api}${SEP}${kind}${SEP}${msg}${SEP}${rem}"
+done <"$parsed" >"$tmp/deco"
+LC_ALL=C sort -s -t "$SEP" -k1,1 -k2,2n -k3,3 "$tmp/deco" >"$sorted"
+
+# Zähler je Objekt / Kategorie-im-Objekt / Check-im-Objekt (Reihenfolge = Dateireihenfolge)
+ocnt=() ccnt=() gcnt=()
+while read -r n; do ocnt+=("$n"); done < <(cut -d "$SEP" -f1   "$sorted" | uniq -c | awk '{print $1}')
+while read -r n; do ccnt+=("$n"); done < <(cut -d "$SEP" -f1,2 "$sorted" | uniq -c | awk '{print $1}')
+while read -r n; do gcnt+=("$n"); done < <(cut -d "$SEP" -f1,3 "$sorted" | uniq -c | awk '{print $1}')
+nobj=${#ocnt[@]}
+nfiles=$(( $(cut -d "$SEP" -f4 "$sorted" | sort -u | wc -l) ))
+
+plural() { if [ "$1" -eq 1 ]; then PL=$2; else PL=$3; fi; }
+
+# lr INDENT LINKS_PLAIN LINKS_FMT RECHTS_PLAIN RECHTS_FMT — rechtsbündig, sonst Umbruch
+lr() {
+  local ind=$1 lp=$2 lf=$3 rp=$4 rf=$5 pad
+  pad=$(( W - ind - ${#lp} - ${#rp} ))
+  if [ "$pad" -lt 2 ]; then
+    printf '%*s%s\n%*s%s\n' "$ind" '' "$lf" "$ind" '' "$rf"
+  else
+    printf '%*s%s%*s%s\n' "$ind" '' "$lf" "$pad" '' "$rf"
+  fi
+}
+
+# Kontextsatz: "Deployment apps/v1 in default, from insecure.yaml"
+context_line() {
+  local s=$1
+  [ -n "$2" ] && s+="${s:+ }${2#/}"
+  [ -n "$3" ] && s+=" in $3"
+  CTX="${s:+$s, }from ${4#"$PWD"/}"
+}
+
+# --- Kopf: Kontext, proportionaler Balken, Legende -----------------------------
+if [ "$nobj" -eq 1 ]; then
+  IFS=$SEP read -r _k _r _c src ns name api kind _rest <"$sorted"
+  context_line "$kind" "$api" "$ns" "$src"
+  lp=$name lf="$BOLD$name$RST"
+else
+  plural "$nfiles" file files; fpl=$PL
+  plural "$nobj" object objects
+  lp="$nobj $PL in $nfiles $fpl" lf=$lp
+fi
+plural "$total" finding findings
+lr 0 "$lp" "$lf" "$total $PL" "$BOLD$RED$total$RST $PL"
+[ "$nobj" -eq 1 ] && printf '%s%s%s\n' "$DIM" "$CTX" "$RST"
+echo
+
+# Balken: jede Kategorie mind. 1 Zelle, Rest geht an die größte
+CELLS=(0 0 0 0 0 0); big=1; sum=0
+for i in 1 2 3 4 5; do
+  if [ "${c_cat[i]}" -gt 0 ]; then
+    CELLS[i]=$(( c_cat[i] * W / total ))
+    [ "${CELLS[i]}" -lt 1 ] && CELLS[i]=1
+  fi
+  sum=$(( sum + CELLS[i] ))
+  [ "${CELLS[i]}" -gt "${CELLS[big]}" ] && big=$i
+done
+CELLS[big]=$(( CELLS[big] + W - sum ))
+
+bar="" legend=""
+for i in 1 2 3 4 5; do
+  [ "${c_cat[i]}" -eq 0 ] && continue
+  printf -v seg '%*s' "${CELLS[i]}" ''
+  seg=${seg// /${GLYPH[i]}}
+  bar+="${CCOL[i]}${seg}${RST}"
+  legend+="${legend:+   }${CCOL[i]}${GLYPH[i]}${RST} ${CNAME[i]} ${BOLD}${c_cat[i]}${RST}"
+done
+printf '%s\n%s\n' "$bar" "$legend"
+
+# --- Findings --------------------------------------------------------------------
+bi=0; [ "$nobj" -gt 1 ] && bi=2
+oi=-1 ci=-1 gi=-1
+prev_key="" prev_rank="" prev_chk=""
+while IFS=$SEP read -r key rank chk src ns name api kind msg rem; do
+
+  if [ "$key" != "$prev_key" ]; then
+    oi=$(( oi + 1 )); prev_key=$key; prev_rank=""; prev_chk=""
+    if [ "$nobj" -gt 1 ]; then
+      plural "${ocnt[oi]}" finding findings
+      context_line "$kind" "$api" "$ns" "$src"
+      echo
+      lr 0 "$name" "$BOLD$name$RST" "${ocnt[oi]} $PL" "$BOLD$RED${ocnt[oi]}$RST $PL"
+      printf '%s%s%s\n' "$DIM" "$CTX" "$RST"
+    fi
+  fi
+
+  if [ "$rank" != "$prev_rank" ]; then
+    ci=$(( ci + 1 )); prev_rank=$rank; prev_chk=""
+    echo
+    printf '%*s%s%s%s  %s%s%s\n' "$bi" '' "$BOLD${CCOL[rank]}" "${CNAME[rank]}" "$RST" "$DIM" "${ccnt[ci]}" "$RST"
+  fi
+
+  ind=$(( bi + 2 ))
+  if [ "$chk" != "$prev_chk" ]; then
+    gi=$(( gi + 1 )); prev_chk=$chk
+    gn=${gcnt[gi]}
+    title_for "$chk"
+    t=$TITLE; [ "$gn" -gt 1 ] && t+=" ($gn)"
+    lr "$ind" "$t" "$BOLD$t$RST" "$chk" "$CYAN$chk$RST"
+    shown_fix=0
+  fi
+
+  pretty_msg "$chk" "$msg"
+  if [ "$gn" -gt 1 ]; then
+    wrap "$PMSG" $(( W - ind - 2 )) 3
+    first="- "
+    for l in ${WRAPPED[@]+"${WRAPPED[@]}"}; do
+      printf '%*s%s%s\n' "$ind" '' "$first" "$l"; first="  "
+    done
+  else
+    wrap "$PMSG" $(( W - ind )) 3
+    for l in ${WRAPPED[@]+"${WRAPPED[@]}"}; do printf '%*s%s\n' "$ind" '' "$l"; done
+  fi
+
+  # Remediation einmal pro Check-Gruppe
+  if [ "${KLP_FIX:-}" = 1 ] && [ -n "$rem" ] && [ "$shown_fix" -eq 0 ]; then
+    shown_fix=1
+    wrap "Fix: $rem" $(( W - ind )) 2
+    for l in ${WRAPPED[@]+"${WRAPPED[@]}"}; do printf '%*s%s%s%s\n' "$ind" '' "$DIM" "$l" "$RST"; done
+  fi
+done <"$sorted"
+
+# --- Footer ----------------------------------------------------------------------
+plural "$total" finding findings; fw=$PL
+plural "$nobj" object objects;    ow=$PL
+echo
+printf '%s%s%s %s%s%s %s in %s %s, exit code %s\n' \
+  "$RED" "$FAIL" "$RST" "$BOLD" "$total" "$RST" "$fw" "$nobj" "$ow" "$lint_rc"
+
+# Plausibilitätscheck gegen kube-linters eigene Zählung
+expected=$(sed -n 's/^Error: found \([0-9][0-9]*\) lint error.*/\1/p' "$raw" | tail -n 1)
+if [ -n "$expected" ] && [ "$expected" != "$total" ]; then
+  echo "Note: kube-linter reports $expected, parsed $total. Original output: KLP_RAW=1" >&2
+fi
+
+exit "$lint_rc"

@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: legacy-redis
+  namespace: cache
+spec:
+  selector:
+    matchLabels: {app: legacy-redis}
+  template:
+    metadata:
+      labels: {app: legacy-redis}
+    spec:
+      containers:
+      - name: redis
+        image: redis:latest
