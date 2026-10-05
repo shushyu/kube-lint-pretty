@@ -2,42 +2,8 @@
 
 A single-file Bash wrapper around [KubeLinter](https://github.com/stackrox/kube-linter) that turns its wall of text into a readable report: findings grouped by category, a proportional overview bar, repeated checks collapsed, and the original exit code preserved for CI.
 
-```
-insecure-nginx                                                           11 findings
-Deployment apps/v1 in default, from test/fixtures/insecure.yaml
+<img width="873" height="801" alt="image" src="https://github.com/user-attachments/assets/d531d8c3-d0f9-4c20-83bd-bde8d4abd638" />
 
-██████████████████████████████████████████████████████████████▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░
-█ Security 8   ▒ Resources 2   ░ Hygiene 1
-
-Security  8
-  NET_RAW capability configuration (2)                       drop-net-raw-capability
-  - Container "nginx" adds the forbidden NET_RAW capability.
-  - Container "nginx" does not drop NET_RAW.
-  Host network namespace enabled                                        host-network
-  Workload shares the host network namespace.
-  Host process namespace enabled                                            host-pid
-  Workload shares the host process namespace.
-  Writable root filesystem                                      no-read-only-root-fs
-  Container "nginx" does not use a read-only root filesystem.
-  Privilege escalation allowed                        privilege-escalation-container
-  Container "nginx" permits privilege escalation.
-  Privileged container                                          privileged-container
-  Container "nginx" runs in privileged mode.
-  Container may run as root                                          run-as-non-root
-  Container "nginx" is not configured with runAsNonRoot.
-
-Resources  2
-  CPU requirements missing                                    unset-cpu-requirements
-  Container "nginx" has no CPU request.
-  Memory requirements missing                              unset-memory-requirements
-  Container "nginx" has no memory limit.
-
-Hygiene  1
-  Image uses :latest                                                      latest-tag
-  Container "nginx" uses nginx:latest; use an immutable, versioned image tag.
-
-✗ 11 findings in 1 object, exit code 1
-```
 
 ## Requirements
 
